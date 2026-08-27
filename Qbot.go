@@ -1,1507 +1,1913 @@
 package main
 
 import (
-	"context"
-	crand "crypto/rand"
-	"encoding/hex"
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
-	mathrand "math/rand"
-
-	"github.com/gin-gonic/gin"
-	"github.com/go-resty/resty/v2"
-	"github.com/robfig/cron/v3"
-	"github.com/sirupsen/logrus"
-
-	"github.com/tencent-connect/botgo"
-	"github.com/tencent-connect/botgo/dto"
-	"github.com/tencent-connect/botgo/event"
-	"github.com/tencent-connect/botgo/interaction/webhook"
-	"github.com/tencent-connect/botgo/openapi"
-	"github.com/tencent-connect/botgo/token"
-
-	"gorm.io/driver/sqlite"
-	"gorm.io/gorm"
+	"github.com/gorilla/websocket"
 )
 
 const (
-	QbotName    = "Qbot"
-	QbotVersion = "1.0.0"
+	Version = "v0.2.1"
+
+	APIBaseURL = "https://api.bot.qq.com"
+	TokenURL   = "https://bots.qq.com/app/getAppAccessToken"
+
+	WebHost = "127.0.0.1"
+	WebPort = 8080
+
+	ReconnectMin = 3 * time.Second
+	ReconnectMax = 30 * time.Second
+
+	ConfigFile = "qbot_config.json"
 )
 
 var (
-	db     *gorm.DB
-	logger = logrus.New()
+	appID     string
+	appSecret string
 
-	configMu sync.RWMutex
+	accessToken string
+	tokenExpire time.Time
 
-	rateMu    sync.Mutex
-	lastSpeak = make(map[string]time.Time)
+	wsConn *websocket.Conn
+	connMu sync.Mutex
 
-	guessMu sync.Mutex
-	guesses = make(map[string]int)
+	running bool
+	ready   bool
 
-	botMu      sync.RWMutex
-	botAPI     openapi.OpenAPI
-	botCancel  context.CancelFunc
-	botRunning bool
-	botAppID   string
-	botSecret  string
+	stateMu sync.RWMutex
 
-	botInitMu sync.Mutex
+	sessionID string
+	botID     string
+	botName   string
+
+	sequence int64
+
+	heartbeatInterval time.Duration
+
+	lastHeartbeat    time.Time
+	lastHeartbeatACK time.Time
+	lastConnect      time.Time
+	lastDisconnect   time.Time
+
+	reconnectCount int
+
+	logMu    sync.Mutex
+	logLines []string
+
+	stopBotChan chan struct{}
+
+	configMu sync.Mutex
 )
 
-type MessageRecord struct {
-	ID        uint      `gorm:"primaryKey" json:"id"`
-	GroupID   string    `json:"group_id"`
-	UserID    string    `json:"user_id"`
-	Username  string    `json:"username"`
-	Content   string    `json:"content"`
-	IsCommand bool      `json:"is_command"`
-	Command   string    `json:"command"`
-	CreatedAt time.Time `json:"created_at"`
+type Config struct {
+	AppID     string `json:"app_id"`
+	AppSecret string `json:"app_secret"`
 }
 
-type SensitiveWord struct {
-	ID   uint   `gorm:"primaryKey" json:"id"`
-	Word string `gorm:"uniqueIndex;not null" json:"word"`
-}
+//
+// ============================================================
+// 日志
+// ============================================================
+//
 
-type BotConfig struct {
-	ID          uint   `gorm:"primaryKey" json:"id"`
-	ConfigKey   string `gorm:"uniqueIndex;not null" json:"key"`
-	ConfigValue string `json:"value"`
-}
+func addLog(format string, args ...interface{}) {
+	text := fmt.Sprintf(format, args...)
+	line := time.Now().Format("2006-01-02 15:04:05") + " " + text
 
-type CheckinRecord struct {
-	ID        uint      `gorm:"primaryKey"`
-	GroupID   string    `json:"group_id"`
-	UserID    string    `json:"user_id"`
-	Username  string    `json:"username"`
-	Date      string    `json:"date"`
-	CreatedAt time.Time `json:"created_at"`
-}
+	log.Println(text)
 
-var defaultConfigs = map[string]string{
-	"qq_enabled": "false",
-	"qq_appid":   "",
-	"qq_secret":  "",
+	logMu.Lock()
+	logLines = append(logLines, line)
 
-	"weather_enabled": "false",
-	"weather_api_key": "",
-
-	"sensitive_enabled": "true",
-
-	"rate_limit_enabled": "true",
-	"rate_limit_seconds": "5",
-
-	"command_enabled": "true",
-	"command_prefix":  "/",
-
-	"checkin_enabled": "true",
-
-	"morning_enabled": "false",
-	"morning_time":    "08:00",
-	"morning_message": "早上好！",
-
-	"bot_reply_enabled": "true",
-
-	"port": "8080",
-
-	"debug_enabled": "false",
-}
-
-type QQMessage struct {
-	ID       string
-	GroupID  string
-	UserID   string
-	Username string
-	Content  string
-}
-
-func getConfig(key string) string {
-	configMu.RLock()
-	defer configMu.RUnlock()
-
-	var cfg BotConfig
-
-	err := db.Where("config_key = ?", key).First(&cfg).Error
-	if err != nil {
-		return defaultConfigs[key]
+	if len(logLines) > 500 {
+		logLines = logLines[len(logLines)-500:]
 	}
 
-	return cfg.ConfigValue
+	logMu.Unlock()
 }
 
-func setConfig(key, value string) error {
+func getLogs() []string {
+	logMu.Lock()
+	defer logMu.Unlock()
+
+	result := make([]string, len(logLines))
+	copy(result, logLines)
+
+	return result
+}
+
+//
+// ============================================================
+// 配置
+// ============================================================
+//
+
+func loadConfig() {
 	configMu.Lock()
 	defer configMu.Unlock()
 
-	var cfg BotConfig
-
-	err := db.Where("config_key = ?", key).First(&cfg).Error
-
-	if err == gorm.ErrRecordNotFound {
-		return db.Create(&BotConfig{
-			ConfigKey:   key,
-			ConfigValue: value,
-		}).Error
+	data, err := os.ReadFile(ConfigFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			addLog("[CONFIG] 尚未配置 AppID / AppSecret")
+		} else {
+			addLog("[CONFIG] 读取配置失败: %v", err)
+		}
+		return
 	}
+
+	var cfg Config
+
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		addLog("[CONFIG] 配置文件解析失败: %v", err)
+		return
+	}
+
+	appID = strings.TrimSpace(cfg.AppID)
+	appSecret = strings.TrimSpace(cfg.AppSecret)
+
+	if appID != "" {
+		addLog("[CONFIG] AppID 已加载")
+	}
+
+	if appSecret != "" {
+		addLog("[CONFIG] AppSecret 已加载")
+	}
+}
+
+func saveConfig(newAppID, newAppSecret string) error {
+	newAppID = strings.TrimSpace(newAppID)
+	newAppSecret = strings.TrimSpace(newAppSecret)
+
+	if newAppID == "" {
+		return fmt.Errorf("AppID 不能为空")
+	}
+
+	if newAppSecret == "" {
+		return fmt.Errorf("AppSecret 不能为空")
+	}
+
+	cfg := Config{
+		AppID:     newAppID,
+		AppSecret: newAppSecret,
+	}
+
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	configMu.Lock()
+	defer configMu.Unlock()
+
+	if err := os.WriteFile(ConfigFile, data, 0600); err != nil {
+		return err
+	}
+
+	appID = newAppID
+	appSecret = newAppSecret
+
+	accessToken = ""
+	tokenExpire = time.Time{}
+
+	addLog("[CONFIG] AppID / AppSecret 已保存")
+
+	return nil
+}
+
+//
+// ============================================================
+// Token
+// ============================================================
+//
+
+type TokenResponse struct {
+	AccessToken string `json:"access_token"`
+	ExpiresIn   string `json:"expires_in"`
+}
+
+func getAccessToken() error {
+	configMu.Lock()
+	id := appID
+	secret := appSecret
+	configMu.Unlock()
+
+	if id == "" || secret == "" {
+		return fmt.Errorf("请先在 Web 管理后台配置 AppID 和 AppSecret")
+	}
+
+	addLog("[QQ] 正在获取 Access Token")
+
+	payload := map[string]string{
+		"appId":        id,
+		"clientSecret": secret,
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest(
+		http.MethodPost,
+		TokenURL,
+		bytes.NewReader(data),
+	)
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{
+		Timeout: 20 * time.Second,
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf(
+			"Token HTTP %d: %s",
+			resp.StatusCode,
+			string(body),
+		)
+	}
+
+	var result TokenResponse
+
+	if err := json.Unmarshal(body, &result); err != nil {
+		return fmt.Errorf(
+			"Token JSON 解析失败: %w",
+			err,
+		)
+	}
+
+	if result.AccessToken == "" {
+		return fmt.Errorf(
+			"服务器没有返回 access_token: %s",
+			string(body),
+		)
+	}
+
+	accessToken = result.AccessToken
+
+	expiresIn, err := strconv.ParseInt(
+		strings.TrimSpace(result.ExpiresIn),
+			10,
+			64,
+	)
+
+	if err != nil || expiresIn <= 0 {
+		expiresIn = 7200
+	}
+
+	tokenExpire = time.Now().Add(
+		time.Duration(expiresIn) * time.Second,
+	)
+
+	addLog(
+		"[QQ] Access Token 获取成功，有效期 %d 秒",
+		expiresIn,
+	)
+
+	return nil
+}
+
+//
+// ============================================================
+// Gateway
+// ============================================================
+//
+
+type GatewayResponse struct {
+	URL string `json:"url"`
+}
+
+func getGatewayURL() (string, error) {
+	if accessToken == "" {
+		return "", fmt.Errorf("Access Token 为空")
+	}
+
+	req, err := http.NewRequest(
+		http.MethodGet,
+		APIBaseURL+"/gateway",
+		nil,
+	)
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Set(
+		"Authorization",
+		"QQBot "+accessToken,
+	)
+
+	req.Header.Set(
+		"User-Agent",
+		"Qbot/"+Version,
+	)
+
+	client := &http.Client{
+		Timeout: 20 * time.Second,
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf(
+			"Gateway HTTP %d: %s",
+			resp.StatusCode,
+			string(body),
+		)
+	}
+
+	var result GatewayResponse
+
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", err
+	}
+
+	if result.URL == "" {
+		return "", fmt.Errorf(
+			"Gateway URL 为空: %s",
+			string(body),
+		)
+	}
+
+	return result.URL, nil
+}
+
+//
+// ============================================================
+// Gateway Packet
+// ============================================================
+//
+
+type GatewayPacket struct {
+	Op int             `json:"op"`
+	D  json.RawMessage `json:"d"`
+	S  *int64          `json:"s"`
+	T  string          `json:"t"`
+}
+
+type HelloData struct {
+	HeartbeatInterval int64 `json:"heartbeat_interval"`
+}
+
+type IdentifyData struct {
+    Token      string            `json:"token"`
+    Intents    int64             `json:"intents"`
+    Shard      []int             `json:"shard"`
+    Properties map[string]string `json:"properties,omitempty"`
+}
+
+type ReadyData struct {
+	Version   int       `json:"version"`
+	SessionID string    `json:"session_id"`
+	User      ReadyUser `json:"user"`
+}
+
+type ReadyUser struct {
+	ID       string `json:"id"`
+	Username string `json:"username"`
+	Bot      bool   `json:"bot"`
+}
+
+const (
+	IntentGuildMessages        = 1 << 9
+	IntentDirectMessage        = 1 << 12
+	IntentC2CAndGroup          = 1 << 25
+)
+
+//
+// ============================================================
+// 启动 / 停止
+// ============================================================
+//
+
+func startGateway() {
+	stateMu.Lock()
+
+	if running {
+		stateMu.Unlock()
+
+		addLog("[BOT] 已经在运行")
+		return
+	}
+
+	if strings.TrimSpace(appID) == "" ||
+		strings.TrimSpace(appSecret) == "" {
+
+		stateMu.Unlock()
+
+		addLog("[BOT] 未配置 AppID / AppSecret")
+		return
+	}
+
+	running = true
+	ready = false
+	reconnectCount = 0
+
+	stopBotChan = make(chan struct{})
+
+	stateMu.Unlock()
+
+	go gatewayLoop()
+
+	addLog("[BOT] 启动成功")
+}
+
+func stopGateway() {
+	stateMu.Lock()
+
+	if !running {
+		stateMu.Unlock()
+
+		addLog("[BOT] 当前没有运行")
+		return
+	}
+
+	running = false
+	ready = false
+
+	ch := stopBotChan
+	stopBotChan = nil
+
+	stateMu.Unlock()
+
+	if ch != nil {
+		close(ch)
+	}
+
+	closeWebSocket()
+
+	addLog("[BOT] 已停止")
+}
+
+func isRunning() bool {
+	stateMu.RLock()
+	defer stateMu.RUnlock()
+
+	return running
+}
+
+//
+// ============================================================
+// 自动重连
+// ============================================================
+//
+
+func gatewayLoop() {
+	delay := ReconnectMin
+
+	for {
+		if !isRunning() {
+			return
+		}
+
+		if accessToken == "" ||
+			time.Now().After(tokenExpire.Add(-2*time.Minute)) {
+
+			if err := getAccessToken(); err != nil {
+				addLog(
+					"[ERROR] 获取 Access Token 失败: %v",
+					err,
+				)
+
+				sleepOrStop(delay)
+
+				delay *= 2
+
+				if delay > ReconnectMax {
+					delay = ReconnectMax
+				}
+
+				continue
+			}
+		}
+
+		gatewayURL, err := getGatewayURL()
+
+		if err != nil {
+			addLog(
+				"[ERROR] 获取 Gateway 失败: %v",
+				err,
+			)
+
+			sleepOrStop(delay)
+
+			delay *= 2
+
+			if delay > ReconnectMax {
+				delay = ReconnectMax
+			}
+
+			continue
+		}
+
+		addLog(
+			"[GATEWAY] Gateway: %s",
+			gatewayURL,
+		)
+
+		err = connectGateway(gatewayURL)
+
+		if err != nil {
+			addLog(
+				"[GATEWAY] 连接结束: %v",
+				err,
+			)
+		}
+
+		if !isRunning() {
+			return
+		}
+
+		stateMu.Lock()
+
+		reconnectCount++
+		lastDisconnect = time.Now()
+
+		stateMu.Unlock()
+
+		addLog(
+			"[GATEWAY] %s 后重新连接",
+			delay,
+		)
+
+		sleepOrStop(delay)
+
+		delay *= 2
+
+		if delay > ReconnectMax {
+			delay = ReconnectMax
+		}
+	}
+}
+
+//
+// ============================================================
+// WebSocket
+// ============================================================
+//
+
+func connectGateway(url string) error {
+	addLog("[GATEWAY] 正在连接 WebSocket")
+
+	conn, _, err := websocket.DefaultDialer.Dial(
+		url,
+		nil,
+	)
 
 	if err != nil {
 		return err
 	}
 
-	cfg.ConfigValue = value
-	return db.Save(&cfg).Error
-}
+	connMu.Lock()
+	wsConn = conn
+	connMu.Unlock()
 
-func initDefaultConfigs() error {
-	for key, value := range defaultConfigs {
-		var count int64
+	stateMu.Lock()
 
-		if err := db.Model(&BotConfig{}).
-			Where("config_key = ?", key).
-			Count(&count).Error; err != nil {
+	lastConnect = time.Now()
+	ready = false
+
+	stateMu.Unlock()
+
+	addLog("[GATEWAY] WebSocket 已连接")
+
+	defer func() {
+		connMu.Lock()
+
+		if wsConn == conn {
+			_ = conn.Close()
+			wsConn = nil
+		}
+
+		connMu.Unlock()
+	}()
+
+	for {
+		if !isRunning() {
+			return nil
+		}
+
+		_, data, err := conn.ReadMessage()
+
+		if err != nil {
 			return err
 		}
 
-		if count == 0 {
-			if err := db.Create(&BotConfig{
-				ConfigKey:   key,
-				ConfigValue: value,
-			}).Error; err != nil {
-				return err
-			}
+		var packet GatewayPacket
+
+		if err := json.Unmarshal(data, &packet); err != nil {
+			addLog(
+				"[ERROR] Gateway JSON 解析失败: %v",
+				err,
+			)
+
+			continue
+		}
+
+		if packet.S != nil {
+			stateMu.Lock()
+			sequence = *packet.S
+			stateMu.Unlock()
+		}
+
+		if err := handlePacket(packet); err != nil {
+			return err
 		}
 	}
+}
+
+func closeWebSocket() {
+	connMu.Lock()
+	defer connMu.Unlock()
+
+	if wsConn != nil {
+		_ = wsConn.Close()
+		wsConn = nil
+	}
+}
+
+//
+// ============================================================
+// Packet
+// ============================================================
+//
+
+func handlePacket(packet GatewayPacket) error {
+	switch packet.Op {
+
+	case 0:
+		return handleDispatch(packet)
+
+	case 1:
+		addLog("[GATEWAY] 收到 Heartbeat 请求")
+		return sendHeartbeat()
+
+	case 7:
+		addLog("[GATEWAY] 服务器要求重新连接")
+		return fmt.Errorf("server requested reconnect")
+
+	case 9:
+		addLog("[GATEWAY] Invalid Session")
+		return fmt.Errorf("invalid session")
+
+	case 10:
+		return handleHello(packet)
+
+	case 11:
+		stateMu.Lock()
+		lastHeartbeatACK = time.Now()
+		stateMu.Unlock()
+
+		addLog("[GATEWAY] Heartbeat ACK")
+
+	default:
+		addLog(
+			"[GATEWAY] 未处理 Opcode=%d",
+			packet.Op,
+		)
+	}
 
 	return nil
 }
 
-func initDatabase() error {
-	var err error
+func handleHello(packet GatewayPacket) error {
+	var hello HelloData
 
-	db, err = gorm.Open(
-		sqlite.Open("qbot.db"),
-		&gorm.Config{},
+	if err := json.Unmarshal(packet.D, &hello); err != nil {
+		return err
+	}
+
+	interval := time.Duration(
+		hello.HeartbeatInterval,
+	) * time.Millisecond
+
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+
+	stateMu.Lock()
+	heartbeatInterval = interval
+	stateMu.Unlock()
+
+	addLog(
+		"[GATEWAY] Hello，心跳间隔 %s",
+		interval,
 	)
-	if err != nil {
+
+	if err := sendIdentify(); err != nil {
 		return err
 	}
 
-	err = db.AutoMigrate(
-		&MessageRecord{},
-		&SensitiveWord{},
-		&BotConfig{},
-		&CheckinRecord{},
-	)
-	if err != nil {
-		return err
-	}
+	go heartbeatLoop(interval)
 
-	if err := initDefaultConfigs(); err != nil {
-		return err
-	}
-
-	logger.Info("SQLite 初始化成功")
 	return nil
 }
 
-func registerQQHandlers() {
-	event.RegisterHandlers(
-		func(evt *dto.WSPayload, data *dto.WSGroupATMessageData) error {
-			return handleOfficialGroupMessage(data)
+func sendIdentify() error {
+	// QQ C2C 单聊 + 群聊 @机器人
+	//
+	// 1 << 25:
+	// C2C_MESSAGE_CREATE
+	// GROUP_AT_MESSAGE_CREATE
+	//
+	// 如果你的 QQ 开放平台后台同时开启了频道消息，
+	// 再额外加入 1 << 30。
+	var intents int64 = 1 << 25
+
+	data := IdentifyData{
+		// 非常重要：
+		// QQ Gateway 要求这里是：
+		// QQBot {AccessToken}
+		Token: "QQBot " + accessToken,
+
+		Intents: intents,
+
+		// 单连接必须是 [0, 1]
+		// 含义：当前 shard = 0，总 shard = 1
+		Shard: []int{
+			0,
+			1,
+		},
+
+		Properties: map[string]string{
+			"$os":      "windows",
+			"$browser": "Qbot",
+			"$device":  "Qbot",
+		},
+	}
+
+	addLog(
+		"[GATEWAY] Identify intents=%d",
+		intents,
+	)
+
+	err := sendPacket(
+		2,
+		data,
+	)
+
+	if err != nil {
+		return err
+	}
+
+	addLog("[GATEWAY] Identify 已发送")
+
+	return nil
+}
+
+//
+// ============================================================
+// 心跳
+// ============================================================
+//
+
+func heartbeatLoop(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+
+		case <-ticker.C:
+
+			if !isRunning() {
+				return
+			}
+
+			if err := sendHeartbeat(); err != nil {
+				addLog(
+					"[HEARTBEAT] 发送失败: %v",
+					err,
+				)
+
+				closeWebSocket()
+				return
+			}
+
+		case <-stopBotChannel():
+			return
+		}
+	}
+}
+
+func stopBotChannel() <-chan struct{} {
+	stateMu.RLock()
+	ch := stopBotChan
+	stateMu.RUnlock()
+
+	if ch == nil {
+		return make(chan struct{})
+	}
+
+	return ch
+}
+
+func sendHeartbeat() error {
+	stateMu.RLock()
+	seq := sequence
+	stateMu.RUnlock()
+
+	err := sendPacket(1, seq)
+
+	if err == nil {
+		stateMu.Lock()
+		lastHeartbeat = time.Now()
+		stateMu.Unlock()
+
+		addLog(
+			"[HEARTBEAT] seq=%d",
+			seq,
+		)
+	}
+
+	return err
+}
+
+func sendPacket(op int, data interface{}) error {
+	packet := map[string]interface{}{
+		"op": op,
+		"d":  data,
+	}
+
+	raw, err := json.Marshal(packet)
+	if err != nil {
+		return err
+	}
+
+	connMu.Lock()
+	defer connMu.Unlock()
+
+	if wsConn == nil {
+		return fmt.Errorf("WebSocket 未连接")
+	}
+
+	return wsConn.WriteMessage(
+		websocket.TextMessage,
+		raw,
+	)
+}
+
+//
+// ============================================================
+// Dispatch
+// ============================================================
+//
+
+func handleDispatch(packet GatewayPacket) error {
+	switch packet.T {
+
+	case "READY":
+		return handleReady(packet)
+
+	case "RESUMED":
+
+		addLog("[GATEWAY] Session RESUMED")
+
+		stateMu.Lock()
+		ready = true
+		stateMu.Unlock()
+
+		return nil
+
+	case "C2C_MESSAGE_CREATE":
+		return handleC2CMessage(packet)
+
+	case "GROUP_AT_MESSAGE_CREATE":
+		return handleGroupMessage(packet)
+
+	case "GROUP_MESSAGE_CREATE":
+		return handleGroupMessage(packet)
+
+	case "AT_MESSAGE_CREATE":
+		return handleChannelMessage(packet)
+
+	case "DIRECT_MESSAGE_CREATE":
+		return handleDirectMessage(packet)
+
+	default:
+		addLog("[EVENT] %s", packet.T)
+	}
+
+	return nil
+}
+
+//
+// ============================================================
+// READY
+// ============================================================
+//
+
+func handleReady(packet GatewayPacket) error {
+	var data ReadyData
+
+	if err := json.Unmarshal(packet.D, &data); err != nil {
+		return err
+	}
+
+	stateMu.Lock()
+
+	sessionID = data.SessionID
+	botID = data.User.ID
+	botName = data.User.Username
+	ready = true
+	reconnectCount = 0
+
+	stateMu.Unlock()
+
+	addLog("======================================")
+	addLog("[SUCCESS] QQ Bot 已连接")
+	addLog("[BOT] %s (%s)", data.User.Username, data.User.ID)
+	addLog("[SESSION] %s", data.SessionID)
+	addLog("======================================")
+
+	return nil
+}
+
+//
+// ============================================================
+// QQ Message
+// ============================================================
+//
+
+type MessageAuthor struct {
+	ID         string `json:"id"`
+	Username   string `json:"username"`
+	Bot        bool   `json:"bot"`
+	UserOpenID string `json:"user_openid"`
+}
+
+type QQMessage struct {
+	ID          string        `json:"id"`
+	Content     string        `json:"content"`
+	Timestamp   string        `json:"timestamp"`
+	Author      MessageAuthor `json:"author"`
+
+	UserOpenID  string `json:"user_openid"`
+	GroupOpenID string `json:"group_openid"`
+
+	GuildID   string `json:"guild_id"`
+	ChannelID string `json:"channel_id"`
+}
+
+func handleC2CMessage(packet GatewayPacket) error {
+	var msg QQMessage
+
+	if err := json.Unmarshal(packet.D, &msg); err != nil {
+		return err
+	}
+
+	if msg.Author.Bot {
+		return nil
+	}
+
+	userOpenID := msg.UserOpenID
+
+	if userOpenID == "" {
+		userOpenID = msg.Author.UserOpenID
+	}
+
+	content := strings.TrimSpace(msg.Content)
+
+	addLog(
+		"[C2C] %s: %s",
+		msg.Author.Username,
+		content,
+	)
+
+	reply := makeReply(content)
+
+	if reply == "" {
+		return nil
+	}
+
+	return sendC2CMessage(
+		userOpenID,
+		reply,
+		msg.ID,
+	)
+}
+
+func handleGroupMessage(packet GatewayPacket) error {
+	var msg QQMessage
+
+	if err := json.Unmarshal(packet.D, &msg); err != nil {
+		return err
+	}
+
+	if msg.Author.Bot {
+		return nil
+	}
+
+	content := strings.TrimSpace(msg.Content)
+
+	addLog(
+		"[GROUP] %s: %s",
+		msg.Author.Username,
+		content,
+	)
+
+	reply := makeReply(content)
+
+	if reply == "" {
+		return nil
+	}
+
+	return sendGroupMessage(
+		msg.GroupOpenID,
+		reply,
+		msg.ID,
+	)
+}
+
+func handleChannelMessage(packet GatewayPacket) error {
+	var msg QQMessage
+
+	if err := json.Unmarshal(packet.D, &msg); err != nil {
+		return err
+	}
+
+	if msg.Author.Bot {
+		return nil
+	}
+
+	content := strings.TrimSpace(msg.Content)
+
+	addLog(
+		"[CHANNEL] %s: %s",
+		msg.Author.Username,
+		content,
+	)
+
+	reply := makeReply(content)
+
+	if reply == "" {
+		return nil
+	}
+
+	return sendChannelMessage(
+		msg.ChannelID,
+		reply,
+		msg.ID,
+	)
+}
+
+func handleDirectMessage(packet GatewayPacket) error {
+	var msg QQMessage
+
+	if err := json.Unmarshal(packet.D, &msg); err != nil {
+		return err
+	}
+
+	if msg.Author.Bot {
+		return nil
+	}
+
+	content := strings.TrimSpace(msg.Content)
+
+	addLog(
+		"[DIRECT] %s: %s",
+		msg.Author.Username,
+		content,
+	)
+
+	reply := makeReply(content)
+
+	if reply == "" {
+		return nil
+	}
+
+	return sendChannelMessage(
+		msg.ChannelID,
+		reply,
+		msg.ID,
+	)
+}
+
+//
+// ============================================================
+// 回复
+// ============================================================
+//
+
+func makeReply(content string) string {
+	content = strings.TrimSpace(content)
+
+	switch strings.ToLower(content) {
+
+	case "你好":
+		return "你好，我是 Qbot v0.2.1"
+
+	case "hello":
+		return "Hello!"
+
+	case "hi":
+		return "Hi!"
+
+	case "ping", "/ping":
+		return "pong"
+
+	case "版本", "/version":
+		return "Qbot v0.2.1"
+
+	case "状态", "/status":
+		return getBotStatusText()
+
+	case "帮助", "/help":
+		return "可用指令：你好、ping、版本、状态、帮助"
+	}
+
+	return ""
+}
+
+func getBotStatusText() string {
+	stateMu.RLock()
+	defer stateMu.RUnlock()
+
+	if ready {
+		return "Qbot 当前在线，WebSocket 已连接。"
+	}
+
+	if running {
+		return "Qbot 正在连接 QQ Gateway。"
+	}
+
+	return "Qbot 当前已停止。"
+}
+
+//
+// ============================================================
+// REST API
+// ============================================================
+//
+
+type SendMessageRequest struct {
+	Content string `json:"content"`
+	MsgType int    `json:"msg_type"`
+	MsgID   string `json:"msg_id,omitempty"`
+}
+
+type APIError struct {
+	ErrCode int    `json:"err_code"`
+	Message string `json:"message"`
+	TraceID string `json:"trace_id"`
+}
+
+func sendC2CMessage(
+	userOpenID string,
+	content string,
+	msgID string,
+) error {
+
+	if userOpenID == "" {
+		return fmt.Errorf("user_openid 为空")
+	}
+
+	return postAPI(
+		APIBaseURL+"/v2/users/"+userOpenID+"/messages",
+		SendMessageRequest{
+			Content: content,
+			MsgType: 0,
+			MsgID:   msgID,
 		},
 	)
 }
 
-func handleOfficialGroupMessage(data *dto.WSGroupATMessageData) error {
-	if data == nil {
-		return nil
+func sendGroupMessage(
+	groupOpenID string,
+	content string,
+	msgID string,
+) error {
+
+	if groupOpenID == "" {
+		return fmt.Errorf("group_openid 为空")
 	}
 
-	if getConfig("qq_enabled") != "true" {
-		return nil
-	}
-
-	userID := ""
-	username := ""
-
-	if data.Author != nil {
-		userID = data.Author.ID
-		username = data.Author.Username
-	}
-
-	if username == "" && data.Member != nil {
-		username = data.Member.Nick
-	}
-
-	msg := QQMessage{
-		ID:       data.ID,
-		GroupID:  data.GroupID,
-		UserID:   userID,
-		Username: username,
-		Content:  strings.TrimSpace(data.Content),
-	}
-
-	go func() {
-		if err := processGroupMessage(msg); err != nil {
-			logger.Errorf("消息处理失败: %v", err)
-		}
-	}()
-
-	return nil
-}
-
-func startQQBot() error {
-	botInitMu.Lock()
-	defer botInitMu.Unlock()
-
-	appID := strings.TrimSpace(getConfig("qq_appid"))
-	secret := strings.TrimSpace(getConfig("qq_secret"))
-
-	if appID == "" {
-		return fmt.Errorf("QQ AppID 未设置")
-	}
-
-	if secret == "" {
-		return fmt.Errorf("QQ AppSecret 未设置")
-	}
-
-	botMu.RLock()
-	same := botRunning &&
-		botAppID == appID &&
-		botSecret == secret
-	botMu.RUnlock()
-
-	if same {
-		return nil
-	}
-
-	stopQQBotLocked()
-
-	credentials := &token.QQBotCredentials{
-		AppID:     appID,
-		AppSecret: secret,
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	tokenSource := token.NewQQBotTokenSource(credentials)
-
-	if err := token.StartRefreshAccessToken(
-		ctx,
-		tokenSource,
-	); err != nil {
-		cancel()
-		return fmt.Errorf("QQ AccessToken 初始化失败: %w", err)
-	}
-
-	api := botgo.NewOpenAPI(
-		appID,
-		tokenSource,
-	).
-		WithTimeout(10 * time.Second).
-		SetDebug(getConfig("debug_enabled") == "true")
-
-	botMu.Lock()
-	botAPI = api
-	botCancel = cancel
-	botRunning = true
-	botAppID = appID
-	botSecret = secret
-	botMu.Unlock()
-
-	logger.Infof("QQ Bot 初始化成功，AppID=%s", appID)
-
-	return nil
-}
-
-func stopQQBot() {
-	botInitMu.Lock()
-	defer botInitMu.Unlock()
-
-	stopQQBotLocked()
-}
-
-func stopQQBotLocked() {
-	botMu.Lock()
-	defer botMu.Unlock()
-
-	if botCancel != nil {
-		botCancel()
-	}
-
-	botCancel = nil
-	botAPI = nil
-	botRunning = false
-	botAppID = ""
-	botSecret = ""
-}
-
-func syncQQBot() {
-	if getConfig("qq_enabled") != "true" {
-		stopQQBot()
-		return
-	}
-
-	if err := startQQBot(); err != nil {
-		logger.Warnf("QQ Bot 启动失败: %v", err)
-	}
-}
-
-func qqWebhookHandler(c *gin.Context) {
-	appID := strings.TrimSpace(getConfig("qq_appid"))
-	secret := strings.TrimSpace(getConfig("qq_secret"))
-
-	if appID == "" || secret == "" {
-		c.JSON(http.StatusServiceUnavailable, gin.H{
-			"error": "QQ Bot 尚未配置 AppID / AppSecret",
-		})
-		return
-	}
-
-	if getConfig("qq_enabled") != "true" {
-		c.JSON(http.StatusOK, gin.H{
-			"ok":      true,
-			"enabled": false,
-		})
-		return
-	}
-
-	credentials := &token.QQBotCredentials{
-		AppID:     appID,
-		AppSecret: secret,
-	}
-
-	webhook.HTTPHandler(
-		c.Writer,
-		c.Request,
-		credentials,
+	return postAPI(
+		APIBaseURL+"/v2/groups/"+groupOpenID+"/messages",
+		SendMessageRequest{
+			Content: content,
+			MsgType: 0,
+			MsgID:   msgID,
+		},
 	)
 }
 
-func sendQQMessage(groupID, content, replyMessageID string) error {
-	if getConfig("qq_enabled") != "true" {
-		return nil
+func sendChannelMessage(
+	channelID string,
+	content string,
+	msgID string,
+) error {
+
+	if channelID == "" {
+		return fmt.Errorf("channel_id 为空")
 	}
 
-	if groupID == "" {
-		return fmt.Errorf("groupID 为空")
-	}
-
-	if content == "" {
-		return nil
-	}
-
-	botMu.RLock()
-	api := botAPI
-	running := botRunning
-	botMu.RUnlock()
-
-	if !running || api == nil {
-		return fmt.Errorf("QQ Bot 尚未运行")
-	}
-
-	msg := &dto.MessageToCreate{
-		Content: content,
-		MsgType: dto.TextMsg,
-		MsgID:   replyMessageID,
-	}
-
-	_, err := api.PostGroupMessage(
-		context.Background(),
-		groupID,
-		msg,
+	return postAPI(
+		APIBaseURL+"/v2/channels/"+channelID+"/messages",
+		SendMessageRequest{
+			Content: content,
+			MsgType: 0,
+			MsgID:   msgID,
+		},
 	)
+}
 
+func postAPI(url string, body interface{}) error {
+	data, err := json.Marshal(body)
 	if err != nil {
-		logger.Errorf("QQ 群消息发送失败: %v", err)
 		return err
 	}
 
-	return nil
-}
-
-func processGroupMessage(msg QQMessage) error {
-	content := strings.TrimSpace(msg.Content)
-
-	if content == "" {
-		return nil
-	}
-
-	prefix := getConfig("command_prefix")
-	if prefix == "" {
-		prefix = "/"
-	}
-
-	isCommand := strings.HasPrefix(content, prefix)
-	command := ""
-
-	if isCommand {
-		tmp := strings.TrimSpace(
-			strings.TrimPrefix(content, prefix),
-		)
-
-		fields := strings.Fields(tmp)
-
-		if len(fields) > 0 {
-			command = strings.ToLower(fields[0])
-		}
-	}
-
-	record := MessageRecord{
-		GroupID:   msg.GroupID,
-		UserID:    msg.UserID,
-		Username:  msg.Username,
-		Content:   content,
-		IsCommand: isCommand,
-		Command:   command,
-		CreatedAt: time.Now(),
-	}
-
-	if err := db.Create(&record).Error; err != nil {
-		logger.Warnf("消息保存失败: %v", err)
-	}
-
-	if checkRateLimit(msg.UserID) {
-		return nil
-	}
-
-	if hit, word := checkSensitive(content); hit {
-		logger.Infof(
-			"敏感词命中 group=%s user=%s word=%s",
-			msg.GroupID,
-			msg.UserID,
-			word,
-		)
-
-		if getConfig("bot_reply_enabled") == "true" {
-			_ = sendQQMessage(
-				msg.GroupID,
-				"⚠️ 请注意文明交流，消息包含敏感词。",
-				msg.ID,
-			)
-		}
-
-		return nil
-	}
-
-	if !isCommand {
-		return nil
-	}
-
-	if getConfig("command_enabled") != "true" {
-		return nil
-	}
-
-	withoutPrefix := strings.TrimSpace(
-		strings.TrimPrefix(content, prefix),
+	req, err := http.NewRequest(
+		http.MethodPost,
+		url,
+		bytes.NewReader(data),
 	)
-
-	fields := strings.Fields(withoutPrefix)
-
-	if len(fields) == 0 {
-		return nil
-	}
-
-	command = strings.ToLower(fields[0])
-	args := strings.TrimSpace(
-		strings.TrimPrefix(
-			withoutPrefix,
-			fields[0],
-		),
-	)
-
-	return handleCommand(msg, command, args)
-}
-
-func checkRateLimit(userID string) bool {
-	if getConfig("rate_limit_enabled") != "true" {
-		return false
-	}
-
-	if userID == "" {
-		return false
-	}
-
-	seconds, err := strconv.Atoi(
-		getConfig("rate_limit_seconds"),
-	)
-
-	if err != nil || seconds <= 0 {
-		seconds = 5
-	}
-
-	now := time.Now()
-
-	rateMu.Lock()
-	defer rateMu.Unlock()
-
-	last, exists := lastSpeak[userID]
-
-	if exists &&
-		now.Sub(last) < time.Duration(seconds)*time.Second {
-		return true
-	}
-
-	lastSpeak[userID] = now
-
-	if len(lastSpeak) > 10000 {
-		for id, t := range lastSpeak {
-			if now.Sub(t) > 10*time.Minute {
-				delete(lastSpeak, id)
-			}
-		}
-	}
-
-	return false
-}
-
-func checkSensitive(content string) (bool, string) {
-	if getConfig("sensitive_enabled") != "true" {
-		return false, ""
-	}
-
-	var words []SensitiveWord
-
-	if err := db.Find(&words).Error; err != nil {
-		return false, ""
-	}
-
-	lower := strings.ToLower(content)
-
-	for _, word := range words {
-		if word.Word == "" {
-			continue
-		}
-
-		if strings.Contains(
-			lower,
-			strings.ToLower(word.Word),
-		) {
-			return true, word.Word
-		}
-	}
-
-	return false, ""
-}
-
-func handleCommand(msg QQMessage, command, args string) error {
-	switch command {
-	case "help":
-		recordCommand(command)
-
-		return sendQQMessage(
-			msg.GroupID,
-			"Qbot 指令：\n"+
-				"/help - 查看帮助\n"+
-				"/dice - 掷骰子\n"+
-				"/guess N - 猜数字\n"+
-				"/weather 城市 - 查询天气\n"+
-				"/checkin - 签到\n"+
-				"/status - 查看状态",
-			msg.ID,
-		)
-
-	case "dice":
-		recordCommand(command)
-
-		n := mathrand.Intn(100) + 1
-
-		return sendQQMessage(
-			msg.GroupID,
-			fmt.Sprintf("🎲 你掷出了：%d", n),
-			msg.ID,
-		)
-
-	case "guess":
-		recordCommand(command)
-		return handleGuess(msg, args)
-
-	case "weather":
-		recordCommand(command)
-
-		if getConfig("weather_enabled") != "true" {
-			return sendQQMessage(
-				msg.GroupID,
-				"天气功能目前没有开启。",
-				msg.ID,
-			)
-		}
-
-		if args == "" {
-			return sendQQMessage(
-				msg.GroupID,
-				"用法：/weather 城市",
-				msg.ID,
-			)
-		}
-
-		go handleWeather(
-			msg.GroupID,
-			args,
-			msg.ID,
-		)
-
-		return nil
-
-	case "checkin":
-		recordCommand(command)
-
-		if getConfig("checkin_enabled") != "true" {
-			return sendQQMessage(
-				msg.GroupID,
-				"签到功能目前没有开启。",
-				msg.ID,
-			)
-		}
-
-		return handleCheckin(msg)
-
-	case "status":
-		recordCommand(command)
-
-		botMu.RLock()
-		running := botRunning
-		botMu.RUnlock()
-
-		text := fmt.Sprintf(
-			"Qbot %s\nQQ Bot：%v\n天气：%v\n敏感词：%v\n防刷屏：%v",
-			QbotVersion,
-			running,
-			getConfig("weather_enabled") == "true",
-			getConfig("sensitive_enabled") == "true",
-			getConfig("rate_limit_enabled") == "true",
-		)
-
-		return sendQQMessage(
-			msg.GroupID,
-			text,
-			msg.ID,
-		)
-
-	default:
-		return sendQQMessage(
-			msg.GroupID,
-			"未知指令，发送 /help 查看帮助。",
-			msg.ID,
-		)
-	}
-}
-
-func handleGuess(msg QQMessage, args string) error {
-	if args == "" {
-		return sendQQMessage(
-			msg.GroupID,
-			"用法：/guess 50",
-			msg.ID,
-		)
-	}
-
-	fields := strings.Fields(args)
-
-	number, err := strconv.Atoi(fields[0])
-
-	if err != nil || number < 1 || number > 100 {
-		return sendQQMessage(
-			msg.GroupID,
-			"请输入 1~100 的数字。",
-			msg.ID,
-		)
-	}
-
-	key := msg.GroupID
-
-	guessMu.Lock()
-
-	target, exists := guesses[key]
-
-	if !exists {
-		target = mathrand.Intn(100) + 1
-		guesses[key] = target
-	}
-
-	guessMu.Unlock()
-
-	if number == target {
-		guessMu.Lock()
-		guesses[key] = mathrand.Intn(100) + 1
-		guessMu.Unlock()
-
-		return sendQQMessage(
-			msg.GroupID,
-			fmt.Sprintf(
-				"🎉 猜对了！答案就是 %d，新的一轮已经开始。",
-				target,
-			),
-			msg.ID,
-		)
-	}
-
-	if number < target {
-		return sendQQMessage(
-			msg.GroupID,
-			"太小了。",
-			msg.ID,
-		)
-	}
-
-	return sendQQMessage(
-		msg.GroupID,
-		"太大了。",
-		msg.ID,
-	)
-}
-
-func handleCheckin(msg QQMessage) error {
-	today := time.Now().Format("2006-01-02")
-
-	var existing CheckinRecord
-
-	err := db.
-		Where(
-			"group_id = ? AND user_id = ? AND date = ?",
-			msg.GroupID,
-			msg.UserID,
-			today,
-		).
-		First(&existing).
-		Error
-
-	if err == nil {
-		return sendQQMessage(
-			msg.GroupID,
-			"你今天已经签到过了。",
-			msg.ID,
-		)
-	}
-
-	record := CheckinRecord{
-		GroupID:   msg.GroupID,
-		UserID:    msg.UserID,
-		Username:  msg.Username,
-		Date:      today,
-		CreatedAt: time.Now(),
-	}
-
-	if err := db.Create(&record).Error; err != nil {
-		return sendQQMessage(
-			msg.GroupID,
-			"签到失败。",
-			msg.ID,
-		)
-	}
-
-	var count int64
-
-	db.Model(&CheckinRecord{}).
-		Where(
-			"group_id = ? AND user_id = ?",
-			msg.GroupID,
-			msg.UserID,
-		).
-		Count(&count)
-
-	return sendQQMessage(
-		msg.GroupID,
-		fmt.Sprintf(
-			"✅ 签到成功！\n累计签到：%d 次",
-			count,
-		),
-		msg.ID,
-	)
-}
-
-func recordCommand(command string) {
-	if command == "" {
-		return
-	}
-
-	var record struct {
-		Command string
-		Count   int64
-	}
-
-	err := db.Table("command_stats").
-		Where("command = ?", command).
-		First(&record).
-		Error
-
-	if err == gorm.ErrRecordNotFound {
-		db.Exec(
-			"CREATE TABLE IF NOT EXISTS command_stats (command TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0)",
-		)
-
-		db.Exec(
-			"INSERT OR IGNORE INTO command_stats(command,count) VALUES(?,0)",
-			command,
-		)
-
-		db.Exec(
-			"UPDATE command_stats SET count=count+1 WHERE command=?",
-			command,
-		)
-
-		return
-	}
-
 	if err != nil {
-		return
+		return err
 	}
 
-	db.Exec(
-		"UPDATE command_stats SET count=count+1 WHERE command=?",
-		command,
+	req.Header.Set(
+		"Authorization",
+		"QQBot "+accessToken,
+	)
+
+	req.Header.Set(
+		"Content-Type",
+		"application/json; charset=utf-8",
+	)
+
+	req.Header.Set(
+		"User-Agent",
+		"Qbot/"+Version,
+	)
+
+	client := &http.Client{
+		Timeout: 20 * time.Second,
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+
+	defer resp.Body.Close()
+
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	if resp.StatusCode >= 200 &&
+		resp.StatusCode < 300 {
+
+		addLog(
+			"[API] 消息发送成功 HTTP=%d",
+			resp.StatusCode,
+		)
+
+		return nil
+	}
+
+	var apiErr APIError
+
+	if json.Unmarshal(responseBody, &apiErr) == nil {
+		return fmt.Errorf(
+			"QQ API HTTP=%d err_code=%d message=%s trace_id=%s",
+			resp.StatusCode,
+			apiErr.ErrCode,
+			apiErr.Message,
+			apiErr.TraceID,
+		)
+	}
+
+	return fmt.Errorf(
+		"QQ API HTTP=%d body=%s",
+		resp.StatusCode,
+		string(responseBody),
 	)
 }
 
-func handleWeather(groupID, city, replyID string) {
-	apiKey := strings.TrimSpace(
-		getConfig("weather_api_key"),
-	)
+//
+// ============================================================
+// Web API
+// ============================================================
+//
 
-	if apiKey == "" {
-		_ = sendQQMessage(
-			groupID,
-			"天气 API Key 尚未设置。",
-			replyID,
-		)
-		return
-	}
-
-	client := resty.New().
-		SetTimeout(10 * time.Second)
-
-	resp, err := client.R().
-		SetQueryParams(map[string]string{
-			"location": city,
-			"key":      apiKey,
-			"lang":     "zh",
-		}).
-		Get("https://geoapi.qweather.com/v2/city/lookup")
-
-	if err != nil {
-		_ = sendQQMessage(
-			groupID,
-			"天气查询失败。",
-			replyID,
-		)
-		return
-	}
-
-	var geo struct {
-		Code     string `json:"code"`
-		Location []struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
-		} `json:"location"`
-	}
-
-	if err := json.Unmarshal(resp.Body(), &geo); err != nil {
-		return
-	}
-
-	if geo.Code != "200" || len(geo.Location) == 0 {
-		_ = sendQQMessage(
-			groupID,
-			"找不到城市："+city,
-			replyID,
-		)
-		return
-	}
-
-	locationID := geo.Location[0].ID
-
-	resp, err = client.R().
-		SetQueryParams(map[string]string{
-			"location": locationID,
-			"key":      apiKey,
-			"lang":     "zh",
-		}).
-		Get("https://devapi.qweather.com/v7/weather/now")
-
-	if err != nil {
-		return
-	}
-
-	var weather struct {
-		Code string `json:"code"`
-		Now  struct {
-			Temp      string `json:"temp"`
-			Text      string `json:"text"`
-			FeelsLike string `json:"feelsLike"`
-			Humidity  string `json:"humidity"`
-			WindDir   string `json:"windDir"`
-			WindScale string `json:"windScale"`
-		} `json:"now"`
-	}
-
-	if err := json.Unmarshal(resp.Body(), &weather); err != nil {
-		return
-	}
-
-	if weather.Code != "200" {
-		return
-	}
-
-	text := fmt.Sprintf(
-		"🌤 %s 当前天气\n天气：%s\n温度：%s℃\n体感：%s℃\n湿度：%s%%\n风向：%s\n风力：%s",
-		city,
-		weather.Now.Text,
-		weather.Now.Temp,
-		weather.Now.FeelsLike,
-		weather.Now.Humidity,
-		weather.Now.WindDir,
-		weather.Now.WindScale,
-	)
-
-	_ = sendQQMessage(
-		groupID,
-		text,
-		replyID,
-	)
+type WebConfigRequest struct {
+	AppID     string `json:"app_id"`
+	AppSecret string `json:"app_secret"`
 }
 
-func apiMessages(c *gin.Context) {
-	page, _ := strconv.Atoi(
-		c.DefaultQuery("page", "1"),
-	)
+func webConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		configMu.Lock()
 
-	size, _ := strconv.Atoi(
-		c.DefaultQuery("size", "20"),
-	)
+		result := map[string]interface{}{
+			"app_id":          appID,
+			"has_app_secret": appSecret != "",
+		}
 
-	if page < 1 {
-		page = 1
+		configMu.Unlock()
+
+		writeJSON(w, result)
+		return
 	}
 
-	if size < 1 {
-		size = 20
-	}
-
-	if size > 200 {
-		size = 200
-	}
-
-	keyword := strings.TrimSpace(
-		c.Query("keyword"),
-	)
-
-	var records []MessageRecord
-	var total int64
-
-	query := db.Model(&MessageRecord{})
-
-	if keyword != "" {
-		like := "%" + keyword + "%"
-
-		query = query.Where(
-			"group_id LIKE ? OR user_id LIKE ? OR username LIKE ? OR content LIKE ?",
-			like,
-			like,
-			like,
-			like,
-		)
-	}
-
-	query.Count(&total)
-
-	if err := query.
-		Order("id DESC").
-		Offset((page - 1) * size).
-		Limit(size).
-		Find(&records).
-		Error; err != nil {
-
-		c.JSON(
-			http.StatusInternalServerError,
-			gin.H{"error": err.Error()},
+	if r.Method != http.MethodPost {
+		http.Error(
+			w,
+			"Method Not Allowed",
+			http.StatusMethodNotAllowed,
 		)
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"page":  page,
-		"size":  size,
-		"total": total,
-		"items": records,
+	var req WebConfigRequest
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, map[string]interface{}{
+			"ok":    false,
+			"error": "JSON 格式错误",
+		})
+		return
+	}
+
+	if err := saveConfig(
+		req.AppID,
+		req.AppSecret,
+	); err != nil {
+
+		writeJSON(w, map[string]interface{}{
+			"ok":    false,
+			"error": err.Error(),
+		})
+
+		return
+	}
+
+	writeJSON(w, map[string]interface{}{
+		"ok": true,
 	})
 }
 
-func apiSensitiveList(c *gin.Context) {
-	var words []SensitiveWord
+func webStatus(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	stateMu.RLock()
 
-	if err := db.
-		Order("id DESC").
-		Find(&words).
-		Error; err != nil {
-
-		c.JSON(
-			http.StatusInternalServerError,
-			gin.H{"error": err.Error()},
-		)
-		return
+	status := map[string]interface{}{
+		"version":             Version,
+		"running":             running,
+		"ready":               ready,
+		"app_id":              appID,
+		"bot_id":              botID,
+		"bot_name":            botName,
+		"session_id":          sessionID,
+		"sequence":            sequence,
+		"heartbeat_interval":  heartbeatInterval.String(),
+		"last_heartbeat":      lastHeartbeat,
+		"last_heartbeat_ack":  lastHeartbeatACK,
+		"last_connect":        lastConnect,
+		"last_disconnect":     lastDisconnect,
+		"reconnect_count":     reconnectCount,
+		"has_app_secret":      appSecret != "",
 	}
 
-	c.JSON(http.StatusOK, words)
+	stateMu.RUnlock()
+
+	writeJSON(w, status)
 }
 
-func apiSensitiveAdd(c *gin.Context) {
-	var req struct {
-		Word string `json:"word"`
-	}
+func webStart(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	startGateway()
 
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(
-			http.StatusBadRequest,
-			gin.H{"error": "JSON 格式错误"},
-		)
-		return
-	}
-
-	req.Word = strings.TrimSpace(req.Word)
-
-	if req.Word == "" {
-		c.JSON(
-			http.StatusBadRequest,
-			gin.H{"error": "敏感词不能为空"},
-		)
-		return
-	}
-
-	word := SensitiveWord{
-		Word: req.Word,
-	}
-
-	if err := db.Create(&word).Error; err != nil {
-		c.JSON(
-			http.StatusBadRequest,
-			gin.H{"error": "添加失败，可能已经存在"},
-		)
-		return
-	}
-
-	c.JSON(http.StatusOK, word)
+	writeJSON(
+		w,
+		map[string]interface{}{
+			"ok": true,
+		},
+	)
 }
 
-func apiSensitiveDelete(c *gin.Context) {
-	id, err := strconv.ParseUint(
-		c.Param("id"),
-		10,
-		64,
+func webStop(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	stopGateway()
+
+	writeJSON(
+		w,
+		map[string]interface{}{
+			"ok": true,
+		},
+	)
+}
+
+func webLogs(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	writeJSON(
+		w,
+		map[string]interface{}{
+			"logs": getLogs(),
+		},
+	)
+}
+
+//
+// ============================================================
+// Web Server
+// ============================================================
+//
+
+func startWebServer() {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/", webIndex)
+	mux.HandleFunc("/api/status", webStatus)
+	mux.HandleFunc("/api/config", webConfig)
+	mux.HandleFunc("/api/start", webStart)
+	mux.HandleFunc("/api/stop", webStop)
+	mux.HandleFunc("/api/logs", webLogs)
+
+	address := WebHost + ":" + strconv.Itoa(WebPort)
+
+	addLog(
+		"[WEB] 管理后台: http://%s",
+		address,
+	)
+
+	err := http.ListenAndServe(
+		address,
+		mux,
 	)
 
 	if err != nil {
-		c.JSON(
-			http.StatusBadRequest,
-			gin.H{"error": "ID 错误"},
-		)
-		return
+		log.Println("[WEB] 服务器停止:", err)
 	}
-
-	if err := db.
-		Delete(&SensitiveWord{}, id).
-		Error; err != nil {
-
-		c.JSON(
-			http.StatusInternalServerError,
-			gin.H{"error": err.Error()},
-		)
-		return
-	}
-
-	c.JSON(
-		http.StatusOK,
-		gin.H{"success": true},
-	)
 }
 
-func apiConfigGet(c *gin.Context) {
-	var configs []BotConfig
+//
+// ============================================================
+// Web HTML
+// ============================================================
+//
 
-	if err := db.
-		Order("id ASC").
-		Find(&configs).
-		Error; err != nil {
-
-		c.JSON(
-			http.StatusInternalServerError,
-			gin.H{"error": err.Error()},
-		)
-		return
-	}
-
-	result := make(map[string]string)
-
-	for _, cfg := range configs {
-		result[cfg.ConfigKey] = cfg.ConfigValue
-	}
-
-	c.JSON(http.StatusOK, result)
-}
-
-func apiConfigPut(c *gin.Context) {
-	var values map[string]string
-
-	if err := c.ShouldBindJSON(&values); err != nil {
-		c.JSON(
-			http.StatusBadRequest,
-			gin.H{"error": "JSON 格式错误"},
-		)
-		return
-	}
-
-	qqChanged := false
-
-	for key, value := range values {
-		if key == "qq_appid" ||
-			key == "qq_secret" ||
-			key == "qq_enabled" {
-			qqChanged = true
-		}
-
-		if _, exists := defaultConfigs[key]; !exists {
-			continue
-		}
-
-		if err := setConfig(key, value); err != nil {
-			c.JSON(
-				http.StatusInternalServerError,
-				gin.H{"error": err.Error()},
-			)
-			return
-		}
-	}
-
-	if qqChanged {
-		go syncQQBot()
-	}
-
-	c.JSON(
-		http.StatusOK,
-		gin.H{"success": true},
-	)
-}
-
-func apiStatus(c *gin.Context) {
-	botMu.RLock()
-	running := botRunning
-	appID := botAppID
-	botMu.RUnlock()
-
-	if appID != "" && len(appID) > 8 {
-		appID = appID[:8] + "..."
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"name":    QbotName,
-		"version": QbotVersion,
-
-		"qq_enabled": getConfig("qq_enabled") == "true",
-
-		"qq_running": running,
-
-		"qq_appid": appID,
-
-		"weather_enabled": getConfig("weather_enabled") == "true",
-
-		"sensitive_enabled": getConfig("sensitive_enabled") == "true",
-
-		"rate_limit_enabled": getConfig("rate_limit_enabled") == "true",
-
-		"command_enabled": getConfig("command_enabled") == "true",
-	})
-}
-
-func apiStats(c *gin.Context) {
-	var totalMessages int64
-	var totalCommands int64
-	var sensitiveCount int64
-
-	db.Model(&MessageRecord{}).
-		Count(&totalMessages)
-
-	db.Model(&MessageRecord{}).
-		Where("is_command = ?", true).
-		Count(&totalCommands)
-
-	db.Model(&SensitiveWord{}).
-		Count(&sensitiveCount)
-
-	type CommandStat struct {
-		Command string `json:"command"`
-		Count   int64  `json:"count"`
-	}
-
-	var commandStats []CommandStat
-
-	db.Table("command_stats").
-		Select("command, count").
-		Order("count DESC").
-		Limit(20).
-		Scan(&commandStats)
-
-	c.JSON(http.StatusOK, gin.H{
-		"messages":        totalMessages,
-		"commands":        totalCommands,
-		"sensitive_words": sensitiveCount,
-		"command_rank":    commandStats,
-	})
-}
-
-const indexHTML = `<!DOCTYPE html>
+const webHTML = `
+<!DOCTYPE html>
 <html lang="zh-CN">
+
 <head>
+
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Qbot 管理面板</title>
+
+<meta name="viewport"
+content="width=device-width,initial-scale=1">
+
+<title>Qbot v0.2.1</title>
+
 <style>
-*{box-sizing:border-box}
-body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;background:#f5f7fb;color:#222}
-.header{background:#1677ff;color:#fff;padding:18px 28px;display:flex;justify-content:space-between;align-items:center}
-.header h1{margin:0;font-size:22px}
-.container{max-width:1200px;margin:25px auto;padding:0 18px}
-.tabs{display:flex;gap:8px;margin-bottom:20px;flex-wrap:wrap}
-.tab{border:0;background:#fff;color:#222;padding:11px 18px;border-radius:8px;cursor:pointer}
-.tab.active{background:#1677ff;color:#fff}
-.panel{background:#fff;border-radius:12px;padding:22px;box-shadow:0 2px 10px rgba(0,0,0,.05);margin-bottom:20px}
-h2{margin-top:0}
-.row{display:flex;gap:12px;margin-bottom:15px;align-items:center}
-.row label{width:180px;flex-shrink:0}
-input{width:100%;max-width:600px;padding:10px;border:1px solid #ddd;border-radius:7px}
-button{border:0;background:#1677ff;color:#fff;padding:9px 15px;border-radius:7px;cursor:pointer}
-button.danger{background:#e5484d}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:15px}
-.card{background:#fff;border-radius:10px;padding:18px;box-shadow:0 2px 8px rgba(0,0,0,.04)}
-.number{font-size:28px;font-weight:bold;margin-top:8px}
-table{width:100%;border-collapse:collapse}
-th,td{padding:10px;border-bottom:1px solid #eee;text-align:left}
-.word-list{display:flex;flex-wrap:wrap;gap:8px}
-.word{padding:7px 10px;background:#f0f2f5;border-radius:6px}
-.word button{margin-left:7px;padding:3px 7px;background:#e5484d}
-.hidden{display:none}
-.notice{padding:12px;background:#fffbe6;border:1px solid #ffe58f;border-radius:7px;margin-bottom:15px}
-.switch{display:flex!important;width:auto!important;align-items:center;gap:8px}
-.switch input{width:auto}
+
+* {
+	box-sizing:border-box;
+}
+
+body {
+	margin:0;
+	background:#0f1117;
+	color:#e6e6e6;
+	font-family:
+		-apple-system,
+		BlinkMacSystemFont,
+		"Segoe UI",
+		"Microsoft YaHei",
+		sans-serif;
+}
+
+.header {
+	padding:20px 25px;
+	background:#171a22;
+	border-bottom:1px solid #292d38;
+}
+
+.header h1 {
+	margin:0;
+	font-size:24px;
+}
+
+.header p {
+	margin:7px 0 0;
+	color:#8e96a3;
+}
+
+.container {
+	max-width:1100px;
+	margin:25px auto;
+	padding:0 18px;
+}
+
+.cards {
+	display:grid;
+	grid-template-columns:
+		repeat(auto-fit,minmax(200px,1fr));
+	gap:15px;
+}
+
+.card {
+	background:#171a22;
+	border:1px solid #292d38;
+	border-radius:12px;
+	padding:18px;
+}
+
+.card-title {
+	color:#8e96a3;
+	font-size:13px;
+	margin-bottom:8px;
+}
+
+.card-value {
+	font-size:20px;
+	font-weight:600;
+}
+
+.online {
+	color:#49d17d;
+}
+
+.offline {
+	color:#ff5f5f;
+}
+
+.connecting {
+	color:#f1c75b;
+}
+
+.panel {
+	margin-top:20px;
+	background:#171a22;
+	border:1px solid #292d38;
+	border-radius:12px;
+	padding:20px;
+}
+
+.panel h2 {
+	margin-top:0;
+	font-size:18px;
+}
+
+.input {
+	width:100%;
+	margin-top:8px;
+	margin-bottom:15px;
+	padding:12px;
+	background:#0f1117;
+	color:#fff;
+	border:1px solid #30363d;
+	border-radius:8px;
+	outline:none;
+}
+
+.input:focus {
+	border-color:#58a6ff;
+}
+
+.buttons {
+	margin-top:20px;
+	display:flex;
+	gap:10px;
+	flex-wrap:wrap;
+}
+
+button {
+	border:0;
+	border-radius:8px;
+	padding:11px 20px;
+	font-size:14px;
+	cursor:pointer;
+}
+
+.start {
+	background:#2ea043;
+	color:white;
+}
+
+.stop {
+	background:#da3633;
+	color:white;
+}
+
+.save {
+	background:#238636;
+	color:white;
+}
+
+.refresh {
+	background:#30363d;
+	color:white;
+}
+
+button:hover {
+	opacity:.85;
+}
+
+.logs {
+	margin-top:20px;
+	background:#090b10;
+	border:1px solid #292d38;
+	border-radius:12px;
+	padding:15px;
+}
+
+.logs-title {
+	font-size:16px;
+	margin-bottom:10px;
+}
+
+#log {
+	height:430px;
+	overflow-y:auto;
+	font-family:Consolas,monospace;
+	font-size:13px;
+	white-space:pre-wrap;
+	color:#c9d1d9;
+}
+
+.info {
+	margin-top:20px;
+	display:grid;
+	grid-template-columns:
+		repeat(auto-fit,minmax(280px,1fr));
+	gap:15px;
+}
+
+.info div {
+	background:#171a22;
+	border:1px solid #292d38;
+	border-radius:12px;
+	padding:15px;
+}
+
+.label {
+	color:#8e96a3;
+	font-size:12px;
+}
+
+.value {
+	margin-top:5px;
+	word-break:break-all;
+}
+
+.tip {
+	color:#8e96a3;
+	font-size:13px;
+	line-height:1.6;
+}
+
 </style>
+
 </head>
+
 <body>
 
 <div class="header">
-<div>
-<h1>Qbot</h1>
-<div>QQ 群助手 Go 版</div>
-</div>
-<div id="status">加载中...</div>
+
+<h1>Qbot v0.2.1</h1>
+
+<p>QQ Official Bot · WebSocket 管理后台</p>
+
 </div>
 
 <div class="container">
 
-<div class="tabs">
-<button class="tab active" onclick="showTab('dashboard',this)">控制台</button>
-<button class="tab" onclick="showTab('qq',this)">QQ机器人</button>
-<button class="tab" onclick="showTab('security',this)">群管理</button>
-<button class="tab" onclick="showTab('commands',this)">指令</button>
-<button class="tab" onclick="showTab('sensitive',this)">敏感词</button>
-<button class="tab" onclick="showTab('messages',this)">聊天记录</button>
-<button class="tab" onclick="showTab('config',this)">系统配置</button>
-</div>
-
-<div id="dashboard" class="tabpage">
 <div class="cards">
-<div class="card">QQ Bot<div id="cardQQ" class="number">-</div></div>
-<div class="card">消息数量<div id="cardMessages" class="number">-</div></div>
-<div class="card">指令数量<div id="cardCommands" class="number">-</div></div>
-<div class="card">敏感词<div id="cardSensitive" class="number">-</div></div>
+
+<div class="card">
+
+<div class="card-title">
+运行状态
+</div>
+
+<div id="running"
+class="card-value">
+停止
+</div>
+
+</div>
+
+<div class="card">
+
+<div class="card-title">
+QQ Gateway
+</div>
+
+<div id="ready"
+class="card-value">
+未连接
+</div>
+
+</div>
+
+<div class="card">
+
+<div class="card-title">
+Bot
+</div>
+
+<div id="bot"
+class="card-value">
+-
+</div>
+
+</div>
+
+<div class="card">
+
+<div class="card-title">
+心跳
+</div>
+
+<div id="heartbeat"
+class="card-value">
+-
+</div>
+
+</div>
+
 </div>
 
 <div class="panel">
-<h2>Qbot 状态</h2>
-<div id="dashboardStatus">加载中...</div>
-</div>
-</div>
 
-<div id="qq" class="tabpage hidden">
-<div class="panel">
-<h2>QQ机器人</h2>
+<h2>QQ Bot 配置</h2>
 
-<div class="notice">
-不需要 ADMIN_TOKEN，不需要管理员密码。
-QQ AppID 和 AppSecret 保存到 Qbot SQLite 数据库。
+<div class="tip">
+AppID 和 AppSecret 会保存到程序目录下的
+qbot_config.json。
 </div>
 
-<div class="row">
-<label>启用 QQ Bot</label>
-<label class="switch">
-<input id="qq_enabled" type="checkbox">
-<span>开启后自动启动</span>
-</label>
+<label>AppID</label>
+
+<input
+	id="appID"
+	class="input"
+	type="text"
+	placeholder="请输入 QQ Bot AppID"
+>
+
+<label>AppSecret</label>
+
+<input
+	id="appSecret"
+	class="input"
+	type="password"
+	placeholder="请输入 QQ Bot AppSecret"
+>
+
+<div class="buttons">
+
+<button
+	class="save"
+	onclick="saveConfig()"
+>
+保存配置
+</button>
+
 </div>
 
-<div class="row">
-<label>Bot AppID</label>
-<input id="qq_appid" placeholder="填写 QQ 机器人 AppID">
 </div>
 
-<div class="row">
-<label>Bot AppSecret</label>
-<input id="qq_secret" type="password" placeholder="填写 QQ 机器人 AppSecret">
+<div class="buttons">
+
+<button
+	class="start"
+	onclick="startBot()"
+>
+启动 Bot
+</button>
+
+<button
+	class="stop"
+	onclick="stopBot()"
+>
+停止 Bot
+</button>
+
+<button
+	class="refresh"
+	onclick="refreshAll()"
+>
+刷新
+</button>
+
 </div>
 
-<div class="row">
-<label>Webhook 路径</label>
-<input value="/qqbot/webhook" readonly>
+<div class="info">
+
+<div>
+
+<div class="label">
+AppID
 </div>
 
-<button onclick="saveQQ()">保存 QQ 配置</button>
-</div>
-</div>
-
-<div id="security" class="tabpage hidden">
-<div class="panel">
-<h2>群管理</h2>
-
-<div class="row">
-<label>敏感词过滤</label>
-<input id="sensitive_enabled" type="checkbox">
+<div id="appid"
+class="value">
+-
 </div>
 
-<div class="row">
-<label>防刷屏</label>
-<input id="rate_limit_enabled" type="checkbox">
 </div>
 
-<div class="row">
-<label>防刷屏间隔（秒）</label>
-<input id="rate_limit_seconds" type="number" min="1" max="3600">
+<div>
+
+<div class="label">
+Session ID
 </div>
 
-<div class="row">
-<label>机器人自动回复</label>
-<input id="bot_reply_enabled" type="checkbox">
+<div id="session"
+class="value">
+-
 </div>
 
-<button onclick="saveSecurity()">保存</button>
-</div>
 </div>
 
-<div id="commands" class="tabpage hidden">
-<div class="panel">
-<h2>指令设置</h2>
+<div>
 
-<div class="row">
-<label>指令功能</label>
-<input id="command_enabled" type="checkbox">
+<div class="label">
+Sequence
 </div>
 
-<div class="row">
-<label>指令前缀</label>
-<input id="command_prefix">
+<div id="sequence"
+class="value">
+0
 </div>
 
-<div class="row">
-<label>签到功能</label>
-<input id="checkin_enabled" type="checkbox">
 </div>
 
-<button onclick="saveCommands()">保存</button>
-</div>
-</div>
+<div>
 
-<div id="sensitive" class="tabpage hidden">
-<div class="panel">
-<h2>敏感词管理</h2>
-
-<div class="row">
-<input id="newWord" placeholder="输入敏感词">
-<button onclick="addWord()">添加</button>
+<div class="label">
+重连次数
 </div>
 
-<div id="wordList" class="word-list"></div>
-</div>
-</div>
-
-<div id="messages" class="tabpage hidden">
-<div class="panel">
-<h2>聊天记录</h2>
-
-<div class="row">
-<input id="messageKeyword" placeholder="搜索消息">
-<button onclick="loadMessages()">搜索</button>
+<div id="reconnect"
+class="value">
+0
 </div>
 
-<table>
-<thead>
-<tr>
-<th>ID</th>
-<th>群</th>
-<th>用户</th>
-<th>内容</th>
-<th>指令</th>
-<th>时间</th>
-</tr>
-</thead>
-<tbody id="messageTable"></tbody>
-</table>
-</div>
 </div>
 
-<div id="config" class="tabpage hidden">
-
-<div class="panel">
-<h2>天气</h2>
-
-<div class="row">
-<label>天气功能</label>
-<input id="weather_enabled" type="checkbox">
 </div>
 
-<div class="row">
-<label>和风天气 API Key</label>
-<input id="weather_api_key" type="password">
+<div class="logs">
+
+<div class="logs-title">
+实时日志
 </div>
 
-<button onclick="saveWeather()">保存天气配置</button>
-</div>
-
-<div class="panel">
-<h2>早安任务</h2>
-
-<div class="row">
-<label>启用</label>
-<input id="morning_enabled" type="checkbox">
-</div>
-
-<div class="row">
-<label>时间</label>
-<input id="morning_time" type="time">
-</div>
-
-<div class="row">
-<label>消息</label>
-<input id="morning_message">
-</div>
-
-<button onclick="saveMorning()">保存</button>
-</div>
-
-<div class="panel">
-<h2>系统</h2>
-
-<div class="row">
-<label>Web 端口</label>
-<input id="port">
-</div>
-
-<button onclick="savePort()">保存端口</button>
+<div id="log">
+正在加载...
 </div>
 
 </div>
@@ -1509,379 +1915,394 @@ QQ AppID 和 AppSecret 保存到 Qbot SQLite 数据库。
 </div>
 
 <script>
-let config={};
 
-function $(id){return document.getElementById(id)}
+async function api(url, options) {
 
-function showTab(id,btn){
-document.querySelectorAll(".tabpage").forEach(x=>x.classList.add("hidden"));
-$(id).classList.remove("hidden");
-document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));
-btn.classList.add("active");
-if(id==="messages")loadMessages();
-if(id==="sensitive")loadSensitive();
+	const response =
+		await fetch(url, options || {});
+
+	return await response.json();
+
 }
 
-async function api(url,options={}){
-const r=await fetch(url,options);
-if(!r.ok){
-throw new Error(await r.text());
-}
-return r.json();
-}
+async function loadConfig() {
 
-async function loadConfig(){
-config=await api("/api/config");
+	try {
 
-$("qq_enabled").checked=config.qq_enabled==="true";
-$("qq_appid").value=config.qq_appid||"";
-$("qq_secret").value=config.qq_secret||"";
+		const data =
+			await api("/api/config");
 
-$("weather_enabled").checked=config.weather_enabled==="true";
-$("weather_api_key").value=config.weather_api_key||"";
+		document.getElementById("appID")
+			.value =
+			data.app_id || "";
 
-$("sensitive_enabled").checked=config.sensitive_enabled==="true";
-$("rate_limit_enabled").checked=config.rate_limit_enabled==="true";
-$("rate_limit_seconds").value=config.rate_limit_seconds||"5";
-$("bot_reply_enabled").checked=config.bot_reply_enabled==="true";
+	} catch(e) {
 
-$("command_enabled").checked=config.command_enabled==="true";
-$("command_prefix").value=config.command_prefix||"/";
-$("checkin_enabled").checked=config.checkin_enabled==="true";
+		console.error(e);
 
-$("morning_enabled").checked=config.morning_enabled==="true";
-$("morning_time").value=config.morning_time||"08:00";
-$("morning_message").value=config.morning_message||"早上好！";
+	}
 
-$("port").value=config.port||"8080";
 }
 
-async function save(values){
-await api("/api/config",{
-method:"PUT",
-headers:{"Content-Type":"application/json"},
-body:JSON.stringify(values)
-});
-await loadConfig();
-await loadStatus();
-alert("保存成功");
+async function saveConfig() {
+
+	const appID =
+		document.getElementById("appID").value.trim();
+
+	const appSecret =
+		document.getElementById("appSecret").value.trim();
+
+	if (!appID) {
+
+		alert("请输入 AppID");
+
+		return;
+
+	}
+
+	if (!appSecret) {
+
+		alert("请输入 AppSecret");
+
+		return;
+
+	}
+
+	try {
+
+		const data =
+			await api(
+				"/api/config",
+				{
+					method:"POST",
+
+					headers:{
+						"Content-Type":
+							"application/json"
+					},
+
+					body:JSON.stringify({
+						app_id:appID,
+						app_secret:appSecret
+					})
+				}
+			);
+
+		if (data.ok) {
+
+			alert(
+				"配置保存成功"
+			);
+
+			document.getElementById("appSecret")
+				.value = "";
+
+			await refreshAll();
+
+		} else {
+
+			alert(
+				"保存失败：" +
+				(data.error || "未知错误")
+			);
+
+		}
+
+	} catch(e) {
+
+		alert(
+			"请求失败：" + e
+		);
+
+	}
+
 }
 
-async function saveQQ(){
-await save({
-qq_enabled:$("qq_enabled").checked?"true":"false",
-qq_appid:$("qq_appid").value.trim(),
-qq_secret:$("qq_secret").value.trim()
-});
+async function refreshStatus() {
+
+	try {
+
+		const data =
+			await api("/api/status");
+
+		const running =
+			document.getElementById("running");
+
+		const ready =
+			document.getElementById("ready");
+
+		if (data.running) {
+
+			running.textContent =
+				"运行中";
+
+			running.className =
+				"card-value online";
+
+		} else {
+
+			running.textContent =
+				"停止";
+
+			running.className =
+				"card-value offline";
+
+		}
+
+		if (data.ready) {
+
+			ready.textContent =
+				"已连接";
+
+			ready.className =
+				"card-value online";
+
+		} else if (data.running) {
+
+			ready.textContent =
+				"连接中";
+
+			ready.className =
+				"card-value connecting";
+
+		} else {
+
+			ready.textContent =
+				"未连接";
+
+			ready.className =
+				"card-value offline";
+
+		}
+
+		document.getElementById("bot")
+			.textContent =
+			data.bot_name || "-";
+
+		document.getElementById("appid")
+			.textContent =
+			data.app_id || "-";
+
+		document.getElementById("session")
+			.textContent =
+			data.session_id || "-";
+
+		document.getElementById("sequence")
+			.textContent =
+			data.sequence || 0;
+
+		document.getElementById("heartbeat")
+			.textContent =
+			data.last_heartbeat || "-";
+
+		document.getElementById("reconnect")
+			.textContent =
+			data.reconnect_count || 0;
+
+	} catch(e) {
+
+		console.error(e);
+
+	}
+
 }
 
-async function saveSecurity(){
-await save({
-sensitive_enabled:$("sensitive_enabled").checked?"true":"false",
-rate_limit_enabled:$("rate_limit_enabled").checked?"true":"false",
-rate_limit_seconds:$("rate_limit_seconds").value,
-bot_reply_enabled:$("bot_reply_enabled").checked?"true":"false"
-});
+async function refreshLogs() {
+
+	try {
+
+		const data =
+			await api("/api/logs");
+
+		const log =
+			document.getElementById("log");
+
+		log.textContent =
+			(data.logs || []).join("\n");
+
+		log.scrollTop =
+			log.scrollHeight;
+
+	} catch(e) {
+
+		console.error(e);
+
+	}
+
 }
 
-async function saveCommands(){
-await save({
-command_enabled:$("command_enabled").checked?"true":"false",
-command_prefix:$("command_prefix").value,
-checkin_enabled:$("checkin_enabled").checked?"true":"false"
-});
+async function startBot() {
+
+	const data =
+		await api(
+			"/api/start",
+			{
+				method:"POST"
+			}
+		);
+
+	await refreshAll();
+
 }
 
-async function saveWeather(){
-await save({
-weather_enabled:$("weather_enabled").checked?"true":"false",
-weather_api_key:$("weather_api_key").value.trim()
-});
+async function stopBot() {
+
+	const data =
+		await api(
+			"/api/stop",
+			{
+				method:"POST"
+			}
+		);
+
+	await refreshAll();
+
 }
 
-async function saveMorning(){
-await save({
-morning_enabled:$("morning_enabled").checked?"true":"false",
-morning_time:$("morning_time").value,
-morning_message:$("morning_message").value
-});
+async function refreshAll() {
+
+	await refreshStatus();
+
+	await refreshLogs();
+
 }
 
-async function savePort(){
-await save({port:$("port").value});
-}
+loadConfig();
 
-async function loadStatus(){
-const s=await api("/api/status");
+refreshAll();
 
-$("status").textContent=s.qq_running?"QQ Bot 运行中":"QQ Bot 未运行";
-$("cardQQ").textContent=s.qq_running?"运行中":"已停止";
-
-$("dashboardStatus").innerHTML=
-"版本："+s.version+
-"<br>QQ："+(s.qq_enabled?"已开启":"已关闭")+
-"<br>QQ运行状态："+(s.qq_running?"运行中":"未运行")+
-"<br>天气："+(s.weather_enabled?"开启":"关闭")+
-"<br>敏感词："+(s.sensitive_enabled?"开启":"关闭")+
-"<br>防刷屏："+(s.rate_limit_enabled?"开启":"关闭")+
-"<br>指令："+(s.command_enabled?"开启":"关闭");
-}
-
-async function loadStats(){
-const s=await api("/api/stats");
-$("cardMessages").textContent=s.messages;
-$("cardCommands").textContent=s.commands;
-$("cardSensitive").textContent=s.sensitive_words;
-}
-
-async function loadSensitive(){
-const words=await api("/api/sensitive");
-
-$("wordList").innerHTML=words.map(w=>
-'<div class="word">'+
-escapeHTML(w.word)+
-'<button onclick="deleteWord('+w.id+')">删除</button>'+
-'</div>'
-).join("");
-}
-
-async function addWord(){
-const word=$("newWord").value.trim();
-
-if(!word)return;
-
-await api("/api/sensitive",{
-method:"POST",
-headers:{"Content-Type":"application/json"},
-body:JSON.stringify({word:word})
-});
-
-$("newWord").value="";
-await loadSensitive();
-await loadStats();
-}
-
-async function deleteWord(id){
-if(!confirm("确定删除这个敏感词吗？"))return;
-
-await api("/api/sensitive/"+id,{
-method:"DELETE"
-});
-
-await loadSensitive();
-await loadStats();
-}
-
-async function loadMessages(){
-const keyword=$("messageKeyword").value.trim();
-
-const data=await api(
-"/api/messages?page=1&size=100&keyword="+
-encodeURIComponent(keyword)
+setInterval(
+	refreshAll,
+	2000
 );
 
-$("messageTable").innerHTML=data.items.map(m=>
-"<tr>"+
-"<td>"+m.id+"</td>"+
-"<td>"+escapeHTML(m.group_id||"")+"</td>"+
-"<td>"+escapeHTML(m.username||m.user_id||"")+"</td>"+
-"<td>"+escapeHTML(m.content||"")+"</td>"+
-"<td>"+escapeHTML(m.command||"")+"</td>"+
-"<td>"+new Date(m.created_at).toLocaleString()+"</td>"+
-"</tr>"
-).join("");
-}
-
-function escapeHTML(v){
-return String(v)
-.replaceAll("&","&amp;")
-.replaceAll("<","&lt;")
-.replaceAll(">","&gt;")
-.replaceAll('"',"&quot;")
-.replaceAll("'","&#039;");
-}
-
-async function refresh(){
-try{
-await loadConfig();
-await loadStatus();
-await loadStats();
-}catch(e){
-console.error(e);
-$("status").textContent="连接失败";
-}
-}
-
-refresh();
-
-setInterval(()=>{
-loadStatus().catch(console.error);
-},5000);
-
-setInterval(()=>{
-loadStats().catch(console.error);
-},10000);
 </script>
 
 </body>
-</html>`
 
-func indexHandler(c *gin.Context) {
-	c.Data(
-		http.StatusOK,
+</html>
+`
+
+//
+// ============================================================
+// JSON
+// ============================================================
+//
+
+func webIndex(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	w.Header().Set(
+		"Content-Type",
 		"text/html; charset=utf-8",
-		[]byte(indexHTML),
-	)
-}
-
-func setupRouter() *gin.Engine {
-	gin.SetMode(gin.ReleaseMode)
-
-	r := gin.New()
-	r.Use(gin.Recovery())
-
-	r.GET("/", indexHandler)
-
-	r.GET("/api/status", apiStatus)
-	r.GET("/api/messages", apiMessages)
-	r.GET("/api/stats", apiStats)
-
-	r.GET("/api/sensitive", apiSensitiveList)
-	r.POST("/api/sensitive", apiSensitiveAdd)
-	r.DELETE("/api/sensitive/:id", apiSensitiveDelete)
-
-	r.GET("/api/config", apiConfigGet)
-	r.PUT("/api/config", apiConfigPut)
-
-	r.POST("/qqbot/webhook", qqWebhookHandler)
-
-	return r
-}
-
-func startCron() {
-	c := cron.New()
-
-	_, err := c.AddFunc(
-		"* * * * *",
-		func() {
-			if getConfig("morning_enabled") != "true" {
-				return
-			}
-
-			target := getConfig("morning_time")
-			if target == "" {
-				target = "08:00"
-			}
-
-			if time.Now().Format("15:04") != target {
-				return
-			}
-
-			message := getConfig("morning_message")
-
-			if message == "" {
-				message = "早上好！"
-			}
-
-			logger.Infof(
-				"早安任务已触发：%s",
-				message,
-			)
-		},
 	)
 
-	if err != nil {
-		logger.Warnf("cron 初始化失败: %v", err)
+	fmt.Fprint(w, webHTML)
+}
+
+func writeJSON(
+	w http.ResponseWriter,
+	data interface{},
+) {
+	w.Header().Set(
+		"Content-Type",
+		"application/json; charset=utf-8",
+	)
+
+	_ = json.NewEncoder(w).Encode(data)
+}
+
+//
+// ============================================================
+// 辅助
+// ============================================================
+//
+
+func sleepOrStop(duration time.Duration) {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+
+	select {
+
+	case <-timer.C:
+		return
+
+	case <-stopBotChannel():
 		return
 	}
-
-	c.Start()
-
-	logger.Info("定时任务已启动")
 }
 
-func initRandom() {
-	mathrand.Seed(time.Now().UnixNano())
+//
+// ============================================================
+// Ctrl+C
+// ============================================================
+//
+
+func setupSignalHandler() {
+	ch := make(chan os.Signal, 1)
+
+	signal.Notify(
+		ch,
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+
+	go func() {
+
+		<-ch
+
+		addLog("[SYSTEM] 正在退出")
+
+		stopGateway()
+
+		time.Sleep(300 * time.Millisecond)
+
+		os.Exit(0)
+
+	}()
 }
 
-func randomID() string {
-	buf := make([]byte, 16)
-
-	if _, err := crand.Read(buf); err != nil {
-		return strconv.FormatInt(
-			time.Now().UnixNano(),
-			10,
-		)
-	}
-
-	return hex.EncodeToString(buf)
-}
-
-func getPort() string {
-	port := strings.TrimSpace(getConfig("port"))
-
-	if port == "" {
-		port = "8080"
-	}
-
-	return port
-}
+//
+// ============================================================
+// main
+// ============================================================
+//
 
 func main() {
-	initRandom()
-
-	logger.SetLevel(logrus.InfoLevel)
-
-	logger.Infof(
-		"%s v%s 启动中...",
-		QbotName,
-		QbotVersion,
+	log.SetFlags(
+		log.LstdFlags |
+			log.Lmicroseconds,
 	)
 
-	if err := initDatabase(); err != nil {
-		logger.Fatalf(
-			"SQLite 初始化失败: %v",
-			err,
+	fmt.Println()
+	fmt.Println("======================================")
+	fmt.Println(" Qbot", Version)
+	fmt.Println(" QQ Official Bot")
+	fmt.Println(" WebSocket + Web Manager")
+	fmt.Println("======================================")
+	fmt.Println()
+
+	loadConfig()
+
+	setupSignalHandler()
+
+	go startWebServer()
+
+	time.Sleep(300 * time.Millisecond)
+
+	if appID != "" && appSecret != "" {
+		startGateway()
+	} else {
+		addLog(
+			"[SYSTEM] 请打开 Web 管理后台配置 AppID / AppSecret",
 		)
 	}
 
-	registerQQHandlers()
+	fmt.Println()
+	fmt.Println("Web 管理后台：")
+	fmt.Println("http://127.0.0.1:8080")
+	fmt.Println()
 
-	if getConfig("qq_enabled") == "true" {
-		go syncQQBot()
-	}
-
-	startCron()
-
-	router := setupRouter()
-	port := getPort()
-
-	logger.Info("================================")
-	logger.Infof(
-		"Qbot Web 管理面板：http://127.0.0.1:%s",
-		port,
-	)
-	logger.Infof(
-		"QQ Webhook：http://127.0.0.1:%s/qqbot/webhook",
-		port,
-	)
-	logger.Info("不需要 ADMIN_TOKEN")
-	logger.Info("不需要管理员密码")
-	logger.Info("================================")
-
-	server := &http.Server{
-		Addr:              ":" + port,
-		Handler:           router,
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-
-	if err := server.ListenAndServe(); err != nil &&
-		err != http.ErrServerClosed {
-		logger.Fatalf(
-			"HTTP 服务启动失败: %v",
-			err,
-		)
-	}
+	select {}
 }
-
-var _ = randomID
